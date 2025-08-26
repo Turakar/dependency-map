@@ -1,5 +1,7 @@
 # dependency-map
 
+![an example dependency map](examples/dependency_map.svg)
+
 ## Plotting dependency maps
 This library helps with plotting dependency maps for DNA language models ([original paper](https://github.com/gagneurlab/dependencies_DNALM)).
 There are three different ways to use this library:

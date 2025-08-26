@@ -210,6 +210,7 @@ class DependencyMap:
         col: int | None = None,
         xaxis_name: str | None = None,
         yaxis_name: str | None = None,
+        axis_offset: int | None = None,
         zmin: float | None = None,
         zmax: float | None = None,
         zero_diagonal: bool = True,
@@ -226,6 +227,7 @@ class DependencyMap:
             col: The column to add the plot to in the figure.
             xaxis_name: The name of the x-axis.
             yaxis_name: The name of the y-axis.
+            xaxis_offset: If provided, both axis will be offset by this amount.
             zmin: The minimum value for the heatmap color scale.
             zmax: The maximum value for the heatmap color scale.
             zero_diagonal: Whether to remove self-dependency in the heatmap.
@@ -263,8 +265,14 @@ class DependencyMap:
             )
 
         # Dependency map
+        if axis_offset is None:
+            axis_offset = 0
+        x = np.arange(axis_offset, axis_offset + dependency_map.shape[1])
+        y = np.arange(axis_offset, axis_offset + dependency_map.shape[0])
         fig.add_trace(
             go.Heatmap(
+                x=x,
+                y=y,
                 z=dependency_map,
                 zmin=zmin,
                 zmax=zmax,

@@ -41,9 +41,10 @@ def main() -> None:
             return logits[:, 2:-1, sequence_tokens].cpu().numpy()
 
     dependency_map = DependencyMap.compute_batched(
-        reference_sequence, tokenize_func, forward_func, subset=(800, 1003)
+        reference_sequence, tokenize_func, forward_func, subset=(850, 950)
     )
     fig = dependency_map.plot()
+    fig.update_layout(margin=dict(l=0, r=0, t=40, b=40))
     fig.write_image("examples/dependency_map.svg")
 
 
