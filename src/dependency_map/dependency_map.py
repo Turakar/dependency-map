@@ -250,7 +250,7 @@ class DependencyMap:
 
         # Create sequence logos
         sequence_logo = SequenceLogo.from_sequence(self.sequence)
-        reconstrution_logo = SequenceLogo.from_reconstruction(self.reconstruction)
+        reconstruction_logo = SequenceLogo.from_reconstruction(self.reconstruction)
 
         # Create the figure
         if fig is None:
@@ -293,13 +293,13 @@ class DependencyMap:
 
         # Sequence logos
         fig.add_layout_image(
-            source=sequence_logo.to_svg(data_url=True),
+            source=reconstruction_logo.to_svg(data_url=True),
             xref=xaxis_name,
             yref=f"{yaxis_name} domain",
             x=-0.5,
             y=1.0,
             sizex=dependency_map.shape[1],
-            sizey=0.05,
+            sizey=0.1,
             xanchor="left",
             yanchor="bottom",
             sizing="stretch",
@@ -317,19 +317,19 @@ class DependencyMap:
             sizing="stretch",
         )
         fig.add_layout_image(
-            source=reconstrution_logo.to_svg(data_url=True, orientation="south"),
+            source=sequence_logo.to_svg(data_url=True, orientation="south"),
             xref=xaxis_name,
             yref=f"{yaxis_name} domain",
             x=-0.5,
             y=0.0,
             sizex=dependency_map.shape[1],
-            sizey=0.1,
+            sizey=0.05,
             xanchor="left",
             yanchor="top",
             sizing="stretch",
         )
         fig.add_layout_image(
-            source=reconstrution_logo.to_svg(data_url=True, orientation="east"),
+            source=reconstruction_logo.to_svg(data_url=True, orientation="east"),
             xref=f"{xaxis_name} domain",
             yref=yaxis_name,
             x=1.0,
