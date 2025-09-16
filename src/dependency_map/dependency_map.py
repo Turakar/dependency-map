@@ -1,4 +1,5 @@
 import functools
+from dataclasses import dataclass
 from typing import Generic, Protocol, Self, TypeVar
 
 import numpy as np
@@ -23,9 +24,22 @@ class ForwardFunc(Protocol, Generic[TokenizedType]):  # pyright: ignore[reportIn
     def __call__(self, batch: list[TokenizedType]) -> np.ndarray: ...
 
 
+@dataclass
+class DependencyMapOptions:
+    """Options for dependency map computation and visualization."""
+
+    effect_on_reference_only: bool = False
+    """If True, only consider effects on the reference base when computing dependency scores.
+    Otherwise, take the maximum effect on any base."""
+
+
 class DependencyMap:
     def __init__(
-        self, sequence: str, dependency_map: np.ndarray, reconstruction: np.ndarray
+        self,
+        sequence: str,
+        dependency_map: np.ndarray,
+        reconstruction: np.ndarray,
+        options: DependencyMapOptions = DependencyMapOptions(),
     ) -> None:
         """
         Initialize a DependencyMap object directly.
@@ -34,10 +48,12 @@ class DependencyMap:
             sequence: The input DNA sequence.
             dependency_map: The computed dependency map as a numpy array.
             reconstruction: The reconstruction probabilities as a numpy array.
+            options: Options for dependency map computation and visualization.
         """
         self.sequence = sequence
         self.dependency_map = dependency_map
         self.reconstruction = reconstruction
+        self.options = options
 
     @staticmethod
     def make_dataset(
@@ -92,13 +108,19 @@ class DependencyMap:
         )
 
     @classmethod
-    def from_logits(cls: type[Self], sequence: str, logits: np.ndarray) -> Self:
+    def from_logits(
+        cls: type[Self],
+        sequence: str,
+        logits: np.ndarray,
+        options: DependencyMapOptions = DependencyMapOptions(),
+    ) -> Self:
         """
         Construct a DependencyMap from model logits.
 
         Args:
             sequence: The input DNA sequence.
             logits: Model output logits with shape (B, L, 4).
+            options: Options for dependency map computation and visualization.
 
         Returns:
             A DependencyMap instance with computed dependency map and reconstruction.
@@ -115,22 +137,35 @@ class DependencyMap:
                 "Logits must have shape B x L x 4 where L is the sequence length and "
                 "B = 1 + L + 3 * L (reference, masked, mutated)."
             )
-        reference = logits[0]
-        masked = logits[1 : 1 + sequence_length]
-        mutated = logits[1 + sequence_length :].reshape(sequence_length, 3, sequence_length, 4)
 
-        # Compute dependency map (log odds ratio)
-        reference_log_odds = _logits_to_log_odds(reference)
-        mutated_log_odds = _logits_to_log_odds(mutated)  # L x 3 x L x 4
-        interaction_scores = mutated_log_odds - reference_log_odds[None, None, :, :]
-        dependency_map = np.max(np.abs(interaction_scores), axis=(1, 3))  # L x L
-
-        # Reconstruction (at masked position)
+        # Compute reconstruction
         reconstruction = softmax(
-            masked[np.arange(sequence_length), np.arange(sequence_length)], axis=-1
+            logits[1 : 1 + sequence_length][np.arange(sequence_length), np.arange(sequence_length)],
+            axis=-1,
         )
 
-        return cls(sequence, dependency_map, reconstruction)
+        # Compute dependency map (log odds ratio)
+        reference = logits[0]
+        mutated = logits[1 + sequence_length :].reshape(sequence_length, 3, sequence_length, 4)
+        reference_log_odds = _logits_to_log_odds(reference)  # L x 4
+        mutated_log_odds = _logits_to_log_odds(mutated)  # L x 3 x L x 4
+        interaction_scores = (
+            mutated_log_odds - reference_log_odds[None, None, :, :]
+        )  # L x 3 x L x 4
+        if options.effect_on_reference_only:
+            # Keep only the logits corresponding to the actual sequence
+            sequence_idx = np.array(["ACGT".index(nt) for nt in sequence])
+            interaction_scores = interaction_scores[
+                np.arange(sequence_length)[:, None, None],
+                np.arange(3)[None, :, None],
+                np.arange(sequence_length)[None, None, :],
+                sequence_idx[None, None, :],
+            ]  # L x 3 x L
+            dependency_map = np.max(np.abs(interaction_scores), axis=1)  # L x L
+        else:
+            dependency_map = np.max(np.abs(interaction_scores), axis=(1, 3))  # L x L
+
+        return cls(sequence, dependency_map, reconstruction, options)
 
     @classmethod
     def compute_batched(
@@ -141,6 +176,7 @@ class DependencyMap:
         batch_size: int = 64,
         enable_progress_bar: bool = True,
         subset: tuple[int, int] | None = None,
+        options: DependencyMapOptions = DependencyMapOptions(),
     ) -> Self:
         """
         Compute dependency map and reconstruction in batches.
@@ -155,6 +191,7 @@ class DependencyMap:
             batch_size: Batch size for forward computation.
             enable_progress_bar: Whether to show a progress bar.
             subset: Optional tuple specifying the start and end indices for a subsequence.
+            options: Options for dependency map computation and visualization.
 
         Returns:
             A DependencyMap instance with computed dependency map and reconstruction.
@@ -173,7 +210,7 @@ class DependencyMap:
         logits = np.concatenate(logits, axis=0)
         if subset is not None:
             sequence = sequence[subset[0] : subset[1]]
-        return cls.from_logits(sequence, logits)
+        return cls.from_logits(sequence, logits, options=options)
 
     @classmethod
     def compute_batched_str(
@@ -182,6 +219,8 @@ class DependencyMap:
         forward_func: ForwardFunc[str],
         batch_size: int = 64,
         enable_progress_bar: bool = True,
+        subset: tuple[int, int] | None = None,
+        options: DependencyMapOptions = DependencyMapOptions(),
     ) -> Self:
         """
         Compute dependency map and reconstruction in batches using string tokenization.
@@ -191,6 +230,8 @@ class DependencyMap:
             forward_func: Function to compute logits from string batch.
             batch_size: Batch size for forward computation.
             enable_progress_bar: Whether to show a progress bar.
+            subset: Optional tuple specifying the start and end indices for a subsequence.
+            options: Options for dependency map computation and visualization.
 
         Returns:
             A DependencyMap instance with computed dependency map and reconstruction.
@@ -201,6 +242,8 @@ class DependencyMap:
             forward_func,
             batch_size,
             enable_progress_bar,
+            subset=subset,
+            options=options,
         )
 
     def plot(
