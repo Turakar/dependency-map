@@ -144,7 +144,8 @@ class DependencyMap:
         """
         Construct a DependencyMap from model logits.
 
-        If a subset is to be analyzed, the logits should correspond to that subset.
+        If a subset is to be analyzed, the logits will be subsetted only along the sequence length in this function.
+        Subsetting along the batch dimension must be done before calling this function.
 
         Args:
             sequence: The input DNA sequence.
@@ -154,31 +155,50 @@ class DependencyMap:
         Returns:
             A DependencyMap instance with computed dependency map and reconstruction.
         """
-        _check_sequence(sequence)
 
-        # Check shape
+        # Check inputs
+        _check_sequence(sequence)
         sequence_length = logits.shape[1]
+        if options.subset is not None:
+            subset_length = options.subset[1] - options.subset[0]
+        else:
+            subset_length = sequence_length
         if (
             logits.ndim != 3
             or logits.shape[-1] != 4
             or (
-                logits.shape[0] != 1 + 4 * sequence_length
+                logits.shape[0] != 1 + 4 * subset_length
                 and not options.autoregressive
                 and options.with_reconstruction
             )
             or (
-                logits.shape[0] != 1 + 3 * sequence_length
+                logits.shape[0] != 1 + 3 * subset_length
                 and not options.autoregressive
                 and not options.with_reconstruction
             )
-            or (logits.shape[0] != 2 * (1 + 3 * sequence_length) and options.autoregressive)
+            or (logits.shape[0] != 2 * (1 + 3 * subset_length) and options.autoregressive)
         ):
             raise ValueError(
-                "Logits must have shape B x L x 4 where L is the sequence length and B is either "
-                "1 + L + 3 * L for non-autoregressive models with reconstruction (reference, masked, mutated), "
-                "1 + 3 * L for non-autoregressive models without reconstruction (reference, mutated), or "
-                "2 * (1 + 3 * L) for autoregressive models (reference, mutated for both strands)."
+                "Logits must have shape B x L x 4 where L is the sequence length, L_sub the subsetted sequence length "
+                "and B is either "
+                "1 + L_sub + 3 * L_sub for non-autoregressive models with reconstruction (reference, masked, mutated), "
+                "1 + 3 * L_sub for non-autoregressive models without reconstruction (reference, mutated), or "
+                "2 * (1 + 3 * L_sub) for autoregressive models (reference, mutated for both strands)."
             )
+
+        if options.subset is not None:
+            # Subset along the sequence length dimension
+            sequence = sequence[options.subset[0] : options.subset[1]]
+            if options.autoregressive:
+                half = logits.shape[0] // 2
+                logits_forward = logits[:half, options.subset[0] : options.subset[1]]
+                logits_reverse = logits[
+                    half:, sequence_length - options.subset[1] : sequence_length - options.subset[0]
+                ]
+                logits = np.concatenate([logits_forward, logits_reverse], axis=0)
+            else:
+                logits = logits[:, options.subset[0] : options.subset[1], :]
+            sequence_length = subset_length
 
         # Upcast for good precision
         logits = logits.astype(np.float64)
@@ -186,15 +206,16 @@ class DependencyMap:
         if options.autoregressive:
             # In autoregressive mode, we compute the dependency map for both the forward and reverse strand,
             # and then stitch them together at the diagonal.
-            options_not_autoregressive = DependencyMapOptions(**options.__dict__)
-            options_not_autoregressive.autoregressive = False
-            options_not_autoregressive.with_reconstruction = False
+            sub_options = DependencyMapOptions(**options.__dict__)
+            sub_options.autoregressive = False
+            sub_options.with_reconstruction = False
+            sub_options.subset = None
             half = logits.shape[0] // 2
             logits_forward = logits[:half]
-            forward = cls.from_logits(sequence, logits_forward, options=options_not_autoregressive)
+            forward = cls.from_logits(sequence, logits_forward, options=sub_options)
             # Make sure to reverse complement the logits back to the original orientation
             logits_reverse = logits[half:, ::-1, ::-1]
-            reverse = cls.from_logits(sequence, logits_reverse, options=options_not_autoregressive)
+            reverse = cls.from_logits(sequence, logits_reverse, options=sub_options)
             # Merge the two dependency maps
             if options.with_reconstruction:
                 reconstruction_fwd = softmax(logits_forward[0], axis=-1)
@@ -282,18 +303,6 @@ class DependencyMap:
             batch_logits = forward_func(dataset[batch_start:batch_end])
             logits.append(batch_logits)
         logits = np.concatenate(logits, axis=0)
-        if options.subset is not None:
-            if options.autoregressive:
-                sequence_length = logits.shape[1]
-                half = logits.shape[0] // 2
-                logits_forward = logits[:half, options.subset[0] : options.subset[1]]
-                logits_reverse = logits[
-                    half:, sequence_length - options.subset[1] : sequence_length - options.subset[0]
-                ]
-                logits = np.concatenate([logits_forward, logits_reverse], axis=0)
-            else:
-                logits = logits[:, options.subset[0] : options.subset[1], :]
-            sequence = sequence[options.subset[0] : options.subset[1]]
         return cls.from_logits(sequence, logits, options=options)
 
     @classmethod
