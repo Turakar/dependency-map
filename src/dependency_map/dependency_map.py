@@ -28,9 +28,20 @@ class ForwardFunc(Protocol, Generic[TokenizedType]):  # pyright: ignore[reportIn
 class DependencyMapOptions:
     """Options for dependency map computation and visualization."""
 
+    subset: tuple[int, int] | None = None
+    """If provided, only compute the dependency map for this subsequence."""
+
     effect_on_reference_only: bool = False
     """If True, only consider effects on the reference base when computing dependency scores.
     Otherwise, take the maximum effect on any base."""
+
+    with_reconstruction: bool = True
+    """If True, compute the reconstruction probabilities for the sequence."""
+
+    autoregressive: bool = False
+    """If True, the model is autoregressive and only considers dependencies from left to right.
+    Therefore, we need about twice as many forwards to consider the reverse complement as well.
+    Also, we do not use masking for computing the reconstruction."""
 
 
 class DependencyMap:
@@ -38,7 +49,7 @@ class DependencyMap:
         self,
         sequence: str,
         dependency_map: np.ndarray,
-        reconstruction: np.ndarray,
+        reconstruction: np.ndarray | None = None,
         options: DependencyMapOptions = DependencyMapOptions(),
     ) -> None:
         """
@@ -50,6 +61,10 @@ class DependencyMap:
             reconstruction: The reconstruction probabilities as a numpy array.
             options: Options for dependency map computation and visualization.
         """
+        if options.with_reconstruction and reconstruction is None:
+            raise ValueError(
+                "Reconstruction must be provided if options.with_reconstruction is True."
+            )
         self.sequence = sequence
         self.dependency_map = dependency_map
         self.reconstruction = reconstruction
@@ -59,7 +74,7 @@ class DependencyMap:
     def make_dataset(
         sequence: str,
         tokenize_func: TokenizeFunc[TokenizedType],
-        subset: tuple[int, int] | None = None,
+        options: DependencyMapOptions = DependencyMapOptions(),
     ) -> list[TokenizedType]:
         """
         Create a dataset of tokenized sequences for dependency map analysis.
@@ -67,30 +82,42 @@ class DependencyMap:
         Args:
             sequence: The input DNA sequence.
             tokenize_func: Function to tokenize the sequence.
-            subset: Optional tuple specifying the start and end indices for a subsequence.
+            options: Options for dependency map computation and visualization.
 
         Returns:
             A list of tokenized sequences including reference, masked, and mutated variants.
         """
         _check_sequence(sequence)
         tokenized = [tokenize_func(sequence, mask=None)]
-        if subset is None:
+        if options.subset is None:
             start, end = 0, len(sequence)
         else:
-            start, end = subset
-        for i in range(start, end):
-            tokenized.append(tokenize_func(sequence, mask=i))
+            start, end = options.subset
+        if not options.autoregressive and options.with_reconstruction:
+            # Masked sequences are only required for non-autoregressive models
+            for i in range(start, end):
+                tokenized.append(tokenize_func(sequence, mask=i))
         for i in range(start, end):
             for nt in "ACGT":
                 if sequence[i] != nt:
                     mutated = list(sequence)
                     mutated[i] = nt
                     tokenized.append(tokenize_func("".join(mutated), mask=None))
+        if options.autoregressive:
+            revcomp = _reverse_complement(sequence)
+            tokenized.append(tokenize_func(revcomp, mask=None))
+            for i in range(start, end):
+                for nt in "ACGT":
+                    if sequence[i] != nt:
+                        mutated = list(sequence)
+                        mutated[i] = nt
+                        revcomp_mutated = _reverse_complement("".join(mutated))
+                        tokenized.append(tokenize_func(revcomp_mutated, mask=None))
         return tokenized
 
     @staticmethod
     def make_dataset_str(
-        sequence: str, mask_char: str = "X", subset: tuple[int, int] | None = None
+        sequence: str, mask_char: str = "_", options: DependencyMapOptions = DependencyMapOptions()
     ) -> list[str]:
         """
         Create a dataset of string sequences with masked characters for dependency map analysis.
@@ -98,13 +125,13 @@ class DependencyMap:
         Args:
             sequence: The input DNA sequence.
             mask_char: Character to use for masking.
-            subset: Optional tuple specifying the start and end indices for a subsequence.
+            options: Options for dependency map computation and visualization.
 
         Returns:
             A list of string sequences including reference, masked, and mutated variants.
         """
         return DependencyMap.make_dataset(
-            sequence, functools.partial(_str_tokenize_func, mask_char=mask_char), subset=subset
+            sequence, functools.partial(_str_tokenize_func, mask_char=mask_char), options=options
         )
 
     @classmethod
@@ -117,6 +144,8 @@ class DependencyMap:
         """
         Construct a DependencyMap from model logits.
 
+        If a subset is to be analyzed, the logits should correspond to that subset.
+
         Args:
             sequence: The input DNA sequence.
             logits: Model output logits with shape (B, L, 4).
@@ -127,26 +156,74 @@ class DependencyMap:
         """
         _check_sequence(sequence)
 
+        # Check shape
+        sequence_length = logits.shape[1]
+        if (
+            logits.ndim != 3
+            or logits.shape[-1] != 4
+            or (
+                logits.shape[0] != 1 + 4 * sequence_length
+                and not options.autoregressive
+                and options.with_reconstruction
+            )
+            or (
+                logits.shape[0] != 1 + 3 * sequence_length
+                and not options.autoregressive
+                and not options.with_reconstruction
+            )
+            or (logits.shape[0] != 2 * (1 + 3 * sequence_length) and options.autoregressive)
+        ):
+            raise ValueError(
+                "Logits must have shape B x L x 4 where L is the sequence length and B is either "
+                "1 + L + 3 * L for non-autoregressive models with reconstruction (reference, masked, mutated), "
+                "1 + 3 * L for non-autoregressive models without reconstruction (reference, mutated), or "
+                "2 * (1 + 3 * L) for autoregressive models (reference, mutated for both strands)."
+            )
+
         # Upcast for good precision
         logits = logits.astype(np.float64)
 
-        # Destructure into reference output, masked output and mutated output
-        sequence_length = logits.shape[1]
-        if logits.ndim != 3 or logits.shape[-1] != 4 or logits.shape[0] != 1 + 4 * sequence_length:
-            raise ValueError(
-                "Logits must have shape B x L x 4 where L is the sequence length and "
-                "B = 1 + L + 3 * L (reference, masked, mutated)."
-            )
+        if options.autoregressive:
+            # In autoregressive mode, we compute the dependency map for both the forward and reverse strand,
+            # and then stitch them together at the diagonal.
+            options_not_autoregressive = DependencyMapOptions(**options.__dict__)
+            options_not_autoregressive.autoregressive = False
+            options_not_autoregressive.with_reconstruction = False
+            half = logits.shape[0] // 2
+            logits_forward = logits[:half]
+            forward = cls.from_logits(sequence, logits_forward, options=options_not_autoregressive)
+            # Make sure to reverse complement the logits back to the original orientation
+            logits_reverse = logits[half:, ::-1, ::-1]
+            reverse = cls.from_logits(sequence, logits_reverse, options=options_not_autoregressive)
+            # Merge the two dependency maps
+            if options.with_reconstruction:
+                reconstruction_fwd = softmax(logits_forward[0], axis=-1)
+                reconstruction_rev = softmax(logits_reverse[0], axis=-1)
+                reconstruction = 0.5 * (reconstruction_fwd + reconstruction_rev)
+            else:
+                reconstruction = None
+            triangle = np.tri(forward.dependency_map.shape[0], k=-1, dtype=bool)
+            dependency_map = np.where(triangle, reverse.dependency_map, forward.dependency_map)
+            return cls(sequence, dependency_map, reconstruction, options)
 
         # Compute reconstruction
-        reconstruction = softmax(
-            logits[1 : 1 + sequence_length][np.arange(sequence_length), np.arange(sequence_length)],
-            axis=-1,
-        )
+        if options.with_reconstruction:
+            reconstruction = softmax(
+                logits[1 : 1 + sequence_length][
+                    np.arange(sequence_length), np.arange(sequence_length)
+                ],
+                axis=-1,
+            )
+        else:
+            reconstruction = None
 
         # Compute dependency map (log odds ratio)
         reference = logits[0]
-        mutated = logits[1 + sequence_length :].reshape(sequence_length, 3, sequence_length, 4)
+        if options.with_reconstruction:
+            mutated = logits[1 + sequence_length :]
+        else:
+            mutated = logits[1:]
+        mutated = mutated.reshape(sequence_length, 3, sequence_length, 4)
         reference_log_odds = _logits_to_log_odds(reference)  # L x 4
         mutated_log_odds = _logits_to_log_odds(mutated)  # L x 3 x L x 4
         interaction_scores = (
@@ -175,7 +252,6 @@ class DependencyMap:
         forward_func: ForwardFunc[TokenizedType],
         batch_size: int = 64,
         enable_progress_bar: bool = True,
-        subset: tuple[int, int] | None = None,
         options: DependencyMapOptions = DependencyMapOptions(),
     ) -> Self:
         """
@@ -196,7 +272,7 @@ class DependencyMap:
         Returns:
             A DependencyMap instance with computed dependency map and reconstruction.
         """
-        dataset = DependencyMap.make_dataset(sequence, tokenize_func, subset=subset)
+        dataset = DependencyMap.make_dataset(sequence, tokenize_func, options=options)
         logits = []
         iterator = range(0, len(dataset), batch_size)
         if enable_progress_bar:
@@ -204,12 +280,20 @@ class DependencyMap:
         for batch_start in iterator:
             batch_end = min(len(dataset), batch_start + batch_size)
             batch_logits = forward_func(dataset[batch_start:batch_end])
-            if subset is not None:
-                batch_logits = batch_logits[:, subset[0] : subset[1], :]
             logits.append(batch_logits)
         logits = np.concatenate(logits, axis=0)
-        if subset is not None:
-            sequence = sequence[subset[0] : subset[1]]
+        if options.subset is not None:
+            if options.autoregressive:
+                sequence_length = logits.shape[1]
+                half = logits.shape[0] // 2
+                logits_forward = logits[:half, options.subset[0] : options.subset[1]]
+                logits_reverse = logits[
+                    half:, sequence_length - options.subset[1] : sequence_length - options.subset[0]
+                ]
+                logits = np.concatenate([logits_forward, logits_reverse], axis=0)
+            else:
+                logits = logits[:, options.subset[0] : options.subset[1], :]
+            sequence = sequence[options.subset[0] : options.subset[1]]
         return cls.from_logits(sequence, logits, options=options)
 
     @classmethod
@@ -219,7 +303,7 @@ class DependencyMap:
         forward_func: ForwardFunc[str],
         batch_size: int = 64,
         enable_progress_bar: bool = True,
-        subset: tuple[int, int] | None = None,
+        mask_char: str = "_",
         options: DependencyMapOptions = DependencyMapOptions(),
     ) -> Self:
         """
@@ -230,7 +314,7 @@ class DependencyMap:
             forward_func: Function to compute logits from string batch.
             batch_size: Batch size for forward computation.
             enable_progress_bar: Whether to show a progress bar.
-            subset: Optional tuple specifying the start and end indices for a subsequence.
+            mask_char: Character to use for masking.
             options: Options for dependency map computation and visualization.
 
         Returns:
@@ -238,11 +322,10 @@ class DependencyMap:
         """
         return cls.compute_batched(
             sequence,
-            functools.partial(_str_tokenize_func, mask_char="X"),
+            functools.partial(_str_tokenize_func, mask_char=mask_char),
             forward_func,
             batch_size,
             enable_progress_bar,
-            subset=subset,
             options=options,
         )
 
@@ -293,7 +376,10 @@ class DependencyMap:
 
         # Create sequence logos
         sequence_logo = SequenceLogo.from_sequence(self.sequence)
-        reconstruction_logo = SequenceLogo.from_reconstruction(self.reconstruction)
+        if self.reconstruction is not None:
+            reconstruction_logo = SequenceLogo.from_reconstruction(self.reconstruction)
+        else:
+            reconstruction_logo = None
 
         # Create the figure
         if fig is None:
@@ -335,54 +421,80 @@ class DependencyMap:
         )
 
         # Sequence logos
-        fig.add_layout_image(
-            source=reconstruction_logo.to_svg(data_url=True),
-            xref=xaxis_name,
-            yref=f"{yaxis_name} domain",
-            x=-0.5,
-            y=1.0,
-            sizex=dependency_map.shape[1],
-            sizey=0.1,
-            xanchor="left",
-            yanchor="bottom",
-            sizing="stretch",
-        )
-        fig.add_layout_image(
-            source=sequence_logo.to_svg(data_url=True, orientation="west"),
-            xref=f"{xaxis_name} domain",
-            yref=yaxis_name,
-            x=0.0,
-            y=dependency_map.shape[0] - 0.5,
-            sizex=0.05,
-            sizey=dependency_map.shape[0],
-            xanchor="right",
-            yanchor="bottom",
-            sizing="stretch",
-        )
-        fig.add_layout_image(
-            source=sequence_logo.to_svg(data_url=True, orientation="south"),
-            xref=xaxis_name,
-            yref=f"{yaxis_name} domain",
-            x=-0.5,
-            y=0.0,
-            sizex=dependency_map.shape[1],
-            sizey=0.05,
-            xanchor="left",
-            yanchor="top",
-            sizing="stretch",
-        )
-        fig.add_layout_image(
-            source=reconstruction_logo.to_svg(data_url=True, orientation="east"),
-            xref=f"{xaxis_name} domain",
-            yref=yaxis_name,
-            x=1.0,
-            y=-0.5,
-            sizex=0.1,
-            sizey=dependency_map.shape[0],
-            xanchor="left",
-            yanchor="top",
-            sizing="stretch",
-        )
+        if reconstruction_logo is not None:
+            fig.add_layout_image(
+                source=reconstruction_logo.to_svg(data_url=True),
+                xref=xaxis_name,
+                yref=f"{yaxis_name} domain",
+                x=-0.5,
+                y=1.0,
+                sizex=dependency_map.shape[1],
+                sizey=0.1,
+                xanchor="left",
+                yanchor="bottom",
+                sizing="stretch",
+            )
+            fig.add_layout_image(
+                source=sequence_logo.to_svg(data_url=True, orientation="west"),
+                xref=f"{xaxis_name} domain",
+                yref=yaxis_name,
+                x=0.0,
+                y=dependency_map.shape[0] - 0.5,
+                sizex=0.05,
+                sizey=dependency_map.shape[0],
+                xanchor="right",
+                yanchor="bottom",
+                sizing="stretch",
+            )
+            fig.add_layout_image(
+                source=sequence_logo.to_svg(data_url=True, orientation="south"),
+                xref=xaxis_name,
+                yref=f"{yaxis_name} domain",
+                x=-0.5,
+                y=0.0,
+                sizex=dependency_map.shape[1],
+                sizey=0.05,
+                xanchor="left",
+                yanchor="top",
+                sizing="stretch",
+            )
+            fig.add_layout_image(
+                source=reconstruction_logo.to_svg(data_url=True, orientation="east"),
+                xref=f"{xaxis_name} domain",
+                yref=yaxis_name,
+                x=1.0,
+                y=-0.5,
+                sizex=0.1,
+                sizey=dependency_map.shape[0],
+                xanchor="left",
+                yanchor="top",
+                sizing="stretch",
+            )
+        else:
+            fig.add_layout_image(
+                source=sequence_logo.to_svg(data_url=True),
+                xref=xaxis_name,
+                yref=f"{yaxis_name} domain",
+                x=-0.5,
+                y=1.0,
+                sizex=dependency_map.shape[1],
+                sizey=0.05,
+                xanchor="left",
+                yanchor="bottom",
+                sizing="stretch",
+            )
+            fig.add_layout_image(
+                source=sequence_logo.to_svg(data_url=True, orientation="east"),
+                xref=f"{xaxis_name} domain",
+                yref=yaxis_name,
+                x=1.0,
+                y=-0.5,
+                sizex=0.05,
+                sizey=dependency_map.shape[0],
+                xanchor="left",
+                yanchor="top",
+                sizing="stretch",
+            )
         return fig
 
 
@@ -416,6 +528,19 @@ def _check_sequence(sequence: str) -> None:
     """
     if not all(nt in "ACGT" for nt in sequence):
         raise ValueError("Sequence must only contain A, C, G, and T.")
+
+
+def _reverse_complement(sequence: str) -> str:
+    """
+    Compute the reverse complement of a DNA sequence.
+
+    Args:
+        sequence: The input DNA sequence.
+
+    Returns:
+        The reverse complement of the sequence.
+    """
+    return "".join({"A": "T", "C": "G", "G": "C", "T": "A"}[nt] for nt in reversed(sequence))
 
 
 def _logits_to_log_odds(logits: np.ndarray) -> np.ndarray:
