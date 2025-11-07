@@ -29,7 +29,10 @@ class DependencyMapOptions:
     """Options for dependency map computation and visualization."""
 
     subset: tuple[int, int] | None = None
-    """If provided, only compute the dependency map for this subsequence."""
+    """If provided, only compute reconstruction and dependency map for this subsequence, but with the full context."""
+
+    subset_rows: tuple[int, int] | None = None
+    """If provided, restrict to these rows of the dependency map."""
 
     effect_on_reference_only: bool = False
     """If True, only consider effects on the reference base when computing dependency scores.
@@ -42,6 +45,43 @@ class DependencyMapOptions:
     """If True, the model is autoregressive and only considers dependencies from left to right.
     Therefore, we need about twice as many forwards to consider the reverse complement as well.
     Also, we do not use masking for computing the reconstruction."""
+
+    dependency_by_masking: bool = False
+    """If True, compute the dependency map by masking each position instead of mutating it."""
+
+    def __post_init__(self) -> None:
+        if self.subset is not None and self.subset_rows is None:
+            self.subset_rows = self.subset
+        elif self.subset is not None and self.subset_rows is not None:
+            subset_start, subset_end = self.subset
+            row_start, row_end = self.subset_rows
+            if not (subset_start <= row_start < row_end <= subset_end):
+                raise ValueError(
+                    "If both `subset` and `subset_rows` are provided, "
+                    "`subset_rows` must be within the range of `subset`."
+                )
+        if self.autoregressive and self.dependency_by_masking:
+            raise ValueError("Dependency by masking is not supported for autoregressive models.")
+
+    def num_samples(self, sequence_length: int) -> int:
+        # Reference
+        samples = 1
+        # Masked
+        if not self.autoregressive and self.with_reconstruction:
+            if self.subset is None:
+                samples += sequence_length
+            else:
+                samples += self.subset[1] - self.subset[0]
+        if not self.dependency_by_masking:
+            # Mutated
+            if self.subset_rows is None:
+                samples += 3 * sequence_length
+            else:
+                samples += 3 * (self.subset_rows[1] - self.subset_rows[0])
+            # Reverse complement
+            if self.autoregressive:
+                samples *= 2
+        return samples
 
 
 class DependencyMap:
@@ -88,31 +128,43 @@ class DependencyMap:
             A list of tokenized sequences including reference, masked, and mutated variants.
         """
         _check_sequence(sequence)
+        # Reference sequence
         tokenized = [tokenize_func(sequence, mask=None)]
-        if options.subset is None:
-            start, end = 0, len(sequence)
-        else:
-            start, end = options.subset
-        if not options.autoregressive and options.with_reconstruction:
-            # Masked sequences are only required for non-autoregressive models
+        # Masked sequences
+        if (
+            not options.autoregressive and options.with_reconstruction
+        ) or options.dependency_by_masking:
+            if options.subset is None:
+                start, end = 0, len(sequence)
+            else:
+                start, end = options.subset
+            if not options.with_reconstruction and options.subset_rows is not None:
+                start, end = options.subset_rows
             for i in range(start, end):
                 tokenized.append(tokenize_func(sequence, mask=i))
-        for i in range(start, end):
-            for nt in "ACGT":
-                if sequence[i] != nt:
-                    mutated = list(sequence)
-                    mutated[i] = nt
-                    tokenized.append(tokenize_func("".join(mutated), mask=None))
-        if options.autoregressive:
-            revcomp = _reverse_complement(sequence)
-            tokenized.append(tokenize_func(revcomp, mask=None))
+        # Mutated sequences
+        if not options.dependency_by_masking:
+            if options.subset_rows is None:
+                start, end = 0, len(sequence)
+            else:
+                start, end = options.subset_rows
             for i in range(start, end):
                 for nt in "ACGT":
                     if sequence[i] != nt:
                         mutated = list(sequence)
                         mutated[i] = nt
-                        revcomp_mutated = _reverse_complement("".join(mutated))
-                        tokenized.append(tokenize_func(revcomp_mutated, mask=None))
+                        tokenized.append(tokenize_func("".join(mutated), mask=None))
+            if options.autoregressive:
+                revcomp = _reverse_complement(sequence)
+                tokenized.append(tokenize_func(revcomp, mask=None))
+                for i in range(start, end):
+                    for nt in "ACGT":
+                        if sequence[i] != nt:
+                            mutated = list(sequence)
+                            mutated[i] = nt
+                            revcomp_mutated = _reverse_complement("".join(mutated))
+                            tokenized.append(tokenize_func(revcomp_mutated, mask=None))
+        assert len(tokenized) == options.num_samples(len(sequence))
         return tokenized
 
     @staticmethod
@@ -166,24 +218,11 @@ class DependencyMap:
         if (
             logits.ndim != 3
             or logits.shape[-1] != 4
-            or (
-                logits.shape[0] != 1 + 4 * subset_length
-                and not options.autoregressive
-                and options.with_reconstruction
-            )
-            or (
-                logits.shape[0] != 1 + 3 * subset_length
-                and not options.autoregressive
-                and not options.with_reconstruction
-            )
-            or (logits.shape[0] != 2 * (1 + 3 * subset_length) and options.autoregressive)
+            or logits.shape[0] != options.num_samples(sequence_length)
         ):
             raise ValueError(
-                "Logits must have shape B x L x 4 where L is the sequence length, L_sub the subsetted sequence length "
-                "and B is either "
-                "1 + L_sub + 3 * L_sub for non-autoregressive models with reconstruction (reference, masked, mutated), "
-                "1 + 3 * L_sub for non-autoregressive models without reconstruction (reference, mutated), or "
-                "2 * (1 + 3 * L_sub) for autoregressive models (reference, mutated for both strands)."
+                f"Logits must have an invalid shape! "
+                f"Expected {(options.num_samples(sequence_length), sequence_length, 4)}, got {logits.shape}."
             )
 
         if options.subset is not None:
@@ -223,7 +262,14 @@ class DependencyMap:
                 reconstruction = 0.5 * (reconstruction_fwd + reconstruction_rev)
             else:
                 reconstruction = None
-            triangle = np.tri(forward.dependency_map.shape[0], k=-1, dtype=bool)
+            triangle = np.tri(sequence_length, k=-1, dtype=bool)
+            if options.subset_rows is not None:
+                row_start, row_end = options.subset_rows
+                if options.subset is not None:
+                    subset_start, subset_end = options.subset
+                    row_start -= subset_start
+                    row_end -= subset_start
+                triangle = triangle[row_start:row_end, :]
             dependency_map = np.where(triangle, reverse.dependency_map, forward.dependency_map)
             return cls(sequence, dependency_map, reconstruction, options)
 
@@ -240,28 +286,58 @@ class DependencyMap:
 
         # Compute dependency map (log odds ratio)
         reference = logits[0]
-        if options.with_reconstruction:
-            mutated = logits[1 + sequence_length :]
+        if options.dependency_by_masking:
+            # Johannes-style dependency maps: mask each position and see effect on all other positions
+            if options.subset_rows is not None and options.with_reconstruction:
+                row_start, row_end = options.subset_rows
+                if options.subset is not None:
+                    subset_start, subset_end = options.subset
+                    row_start -= subset_start
+                    row_end -= subset_start
+                masked = logits[1 + row_start : 1 + row_end]
+            else:  # no subset_rows or no reconstruction, so no overlap of reconstruction and dependency samples
+                masked = logits[1:]
+            reference_log_odds = _logits_to_log_odds(reference)
+            masked_log_odds = _logits_to_log_odds(masked)
+            interaction_scores = masked_log_odds - reference_log_odds[None, :, :]
+            if options.effect_on_reference_only:
+                # Keep only the logits corresponding to the actual sequence
+                sequence_idx = np.array(["ACGT".index(nt) for nt in sequence])
+                interaction_scores = interaction_scores[
+                    np.arange(interaction_scores.shape[0])[:, None],
+                    np.arange(sequence_length)[None, :],
+                    sequence_idx[None, :],
+                ]
+                dependency_map = np.abs(interaction_scores)
+            else:
+                dependency_map = np.max(np.abs(interaction_scores), axis=2)
+
         else:
-            mutated = logits[1:]
-        mutated = mutated.reshape(sequence_length, 3, sequence_length, 4)
-        reference_log_odds = _logits_to_log_odds(reference)  # L x 4
-        mutated_log_odds = _logits_to_log_odds(mutated)  # L x 3 x L x 4
-        interaction_scores = (
-            mutated_log_odds - reference_log_odds[None, None, :, :]
-        )  # L x 3 x L x 4
-        if options.effect_on_reference_only:
-            # Keep only the logits corresponding to the actual sequence
-            sequence_idx = np.array(["ACGT".index(nt) for nt in sequence])
-            interaction_scores = interaction_scores[
-                np.arange(sequence_length)[:, None, None],
-                np.arange(3)[None, :, None],
-                np.arange(sequence_length)[None, None, :],
-                sequence_idx[None, None, :],
-            ]  # L x 3 x L
-            dependency_map = np.max(np.abs(interaction_scores), axis=1)  # L x L
-        else:
-            dependency_map = np.max(np.abs(interaction_scores), axis=(1, 3))  # L x L
+            # Pedro-style dependency maps: mutate each position and see effect on all other positions
+            if options.subset_rows is not None:
+                num_rows = options.subset_rows[1] - options.subset_rows[0]
+            else:
+                num_rows = sequence_length
+            if options.with_reconstruction:
+                mutated = logits[1 + sequence_length :]
+            else:
+                mutated = logits[1:]
+            mutated = mutated.reshape(num_rows, 3, sequence_length, 4)
+            reference_log_odds = _logits_to_log_odds(reference)
+            mutated_log_odds = _logits_to_log_odds(mutated)
+            interaction_scores = mutated_log_odds - reference_log_odds[None, None, :, :]
+            if options.effect_on_reference_only:
+                # Keep only the logits corresponding to the actual sequence
+                sequence_idx = np.array(["ACGT".index(nt) for nt in sequence])
+                interaction_scores = interaction_scores[
+                    np.arange(num_rows)[:, None, None],
+                    np.arange(3)[None, :, None],
+                    np.arange(sequence_length)[None, None, :],
+                    sequence_idx[None, None, :],
+                ]  # L x 3 x L
+                dependency_map = np.max(np.abs(interaction_scores), axis=1)  # L x L
+            else:
+                dependency_map = np.max(np.abs(interaction_scores), axis=(1, 3))  # L x L
 
         return cls(sequence, dependency_map, reconstruction, options)
 
@@ -338,6 +414,22 @@ class DependencyMap:
             options=options,
         )
 
+    def get_depenency_map_without_diagonal(self) -> np.ndarray:
+        """Remove self-dependencies from the dependency map."""
+        row_idx = np.arange(self.dependency_map.shape[0])
+        if self.options.subset_rows is not None:
+            row_start, row_end = self.options.subset_rows
+            if self.options.subset is not None:
+                subset_start, subset_end = self.options.subset
+                row_start -= subset_start
+                row_end -= subset_start
+            column_idx = np.arange(row_start, row_end)
+        else:
+            column_idx = np.arange(self.dependency_map.shape[1])
+        dependency_map = np.copy(self.dependency_map)
+        dependency_map[row_idx, column_idx] = 0.0
+        return dependency_map
+
     def plot(
         self,
         fig: go.Figure | None = None,
@@ -377,9 +469,7 @@ class DependencyMap:
             The figure with the plot.
         """
         if zero_diagonal:
-            # Remove self-dependency
-            dependency_map = np.copy(self.dependency_map)
-            np.fill_diagonal(dependency_map, 0)
+            dependency_map = self.get_depenency_map_without_diagonal()
         else:
             dependency_map = self.dependency_map
 
