@@ -67,11 +67,17 @@ class DependencyMapOptions:
         # Reference
         samples = 1
         # Masked
-        if not self.autoregressive and self.with_reconstruction:
-            if self.subset is None:
-                samples += sequence_length
-            else:
-                samples += self.subset[1] - self.subset[0]
+        if not self.autoregressive:
+            if self.with_reconstruction:
+                if self.subset is None:
+                    samples += sequence_length
+                else:
+                    samples += self.subset[1] - self.subset[0]
+            elif self.dependency_by_masking:
+                if self.subset_rows is None:
+                    samples += sequence_length
+                else:
+                    samples += self.subset_rows[1] - self.subset_rows[0]
         if not self.dependency_by_masking:
             # Mutated
             if self.subset_rows is None:
@@ -82,6 +88,13 @@ class DependencyMapOptions:
             if self.autoregressive:
                 samples *= 2
         return samples
+
+    def get_subset_rows_in_subset(self) -> tuple[int, int]:
+        if self.subset_rows is None:
+            raise ValueError("subset_rows is not set.")
+        if self.subset is None:
+            return self.subset_rows
+        return (self.subset_rows[0] - self.subset[0], self.subset_rows[1] - self.subset[0])
 
 
 class DependencyMap:
@@ -131,12 +144,11 @@ class DependencyMap:
         # Reference sequence
         tokenized = [tokenize_func(sequence, mask=None)]
         # Masked sequences
-        if (
-            not options.autoregressive and options.with_reconstruction
-        ) or options.dependency_by_masking:
-            if options.subset is None:
-                start, end = 0, len(sequence)
-            else:
+        if not options.autoregressive and (
+            options.with_reconstruction or options.dependency_by_masking
+        ):
+            start, end = 0, len(sequence)
+            if options.subset is not None:
                 start, end = options.subset
             if not options.with_reconstruction and options.subset_rows is not None:
                 start, end = options.subset_rows
@@ -164,7 +176,10 @@ class DependencyMap:
                             mutated[i] = nt
                             revcomp_mutated = _reverse_complement("".join(mutated))
                             tokenized.append(tokenize_func(revcomp_mutated, mask=None))
-        assert len(tokenized) == options.num_samples(len(sequence))
+        assert len(tokenized) == options.num_samples(len(sequence)), (
+            f"Number of generated samples {len(tokenized)} does not match expected "
+            f"number {options.num_samples(len(sequence))}."
+        )
         return tokenized
 
     @staticmethod
@@ -264,11 +279,7 @@ class DependencyMap:
                 reconstruction = None
             triangle = np.tri(sequence_length, k=-1, dtype=bool)
             if options.subset_rows is not None:
-                row_start, row_end = options.subset_rows
-                if options.subset is not None:
-                    subset_start, subset_end = options.subset
-                    row_start -= subset_start
-                    row_end -= subset_start
+                row_start, row_end = options.get_subset_rows_in_subset()
                 triangle = triangle[row_start:row_end, :]
             dependency_map = np.where(triangle, reverse.dependency_map, forward.dependency_map)
             return cls(sequence, dependency_map, reconstruction, options)
@@ -289,11 +300,7 @@ class DependencyMap:
         if options.dependency_by_masking:
             # Johannes-style dependency maps: mask each position and see effect on all other positions
             if options.subset_rows is not None and options.with_reconstruction:
-                row_start, row_end = options.subset_rows
-                if options.subset is not None:
-                    subset_start, subset_end = options.subset
-                    row_start -= subset_start
-                    row_end -= subset_start
+                row_start, row_end = options.get_subset_rows_in_subset()
                 masked = logits[1 + row_start : 1 + row_end]
             else:  # no subset_rows or no reconstruction, so no overlap of reconstruction and dependency samples
                 masked = logits[1:]
@@ -418,11 +425,7 @@ class DependencyMap:
         """Remove self-dependencies from the dependency map."""
         row_idx = np.arange(self.dependency_map.shape[0])
         if self.options.subset_rows is not None:
-            row_start, row_end = self.options.subset_rows
-            if self.options.subset is not None:
-                subset_start, subset_end = self.options.subset
-                row_start -= subset_start
-                row_end -= subset_start
+            row_start, row_end = self.options.get_subset_rows_in_subset()
             column_idx = np.arange(row_start, row_end)
         else:
             column_idx = np.arange(self.dependency_map.shape[1])
@@ -475,10 +478,23 @@ class DependencyMap:
 
         # Create sequence logos
         sequence_logo = SequenceLogo.from_sequence(self.sequence)
+        if self.options.subset_rows:
+            row_start, row_end = self.options.get_subset_rows_in_subset()
+            sequence_logo_rows = SequenceLogo.from_sequence(self.sequence[row_start:row_end])
+        else:
+            sequence_logo_rows = sequence_logo
         if self.reconstruction is not None:
             reconstruction_logo = SequenceLogo.from_reconstruction(self.reconstruction)
+            if self.options.subset_rows is not None:
+                row_start, row_end = self.options.get_subset_rows_in_subset()
+                reconstruction_logo_rows = SequenceLogo.from_reconstruction(
+                    self.reconstruction[row_start:row_end]
+                )
+            else:
+                reconstruction_logo_rows = reconstruction_logo
         else:
             reconstruction_logo = None
+            reconstruction_logo_rows = None
 
         # Create the figure
         if fig is None:
@@ -520,7 +536,7 @@ class DependencyMap:
         )
 
         # Sequence logos
-        if reconstruction_logo is not None:
+        if reconstruction_logo is not None and reconstruction_logo_rows is not None:
             fig.add_layout_image(
                 source=reconstruction_logo.to_svg(data_url=True),
                 xref=xaxis_name,
@@ -534,7 +550,7 @@ class DependencyMap:
                 sizing="stretch",
             )
             fig.add_layout_image(
-                source=sequence_logo.to_svg(data_url=True, orientation="west"),
+                source=sequence_logo_rows.to_svg(data_url=True, orientation="west"),
                 xref=f"{xaxis_name} domain",
                 yref=yaxis_name,
                 x=0.0,
@@ -558,7 +574,7 @@ class DependencyMap:
                 sizing="stretch",
             )
             fig.add_layout_image(
-                source=reconstruction_logo.to_svg(data_url=True, orientation="east"),
+                source=reconstruction_logo_rows.to_svg(data_url=True, orientation="east"),
                 xref=f"{xaxis_name} domain",
                 yref=yaxis_name,
                 x=1.0,
@@ -583,7 +599,7 @@ class DependencyMap:
                 sizing="stretch",
             )
             fig.add_layout_image(
-                source=sequence_logo.to_svg(data_url=True, orientation="east"),
+                source=sequence_logo_rows.to_svg(data_url=True, orientation="east"),
                 xref=f"{xaxis_name} domain",
                 yref=yaxis_name,
                 x=1.0,
