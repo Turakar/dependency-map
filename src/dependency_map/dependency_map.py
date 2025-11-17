@@ -3,6 +3,7 @@ from dataclasses import dataclass
 from typing import Generic, Protocol, Self, TypeVar
 
 import numpy as np
+import polars as pl
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 from scipy.special import log_softmax, softmax
@@ -10,6 +11,7 @@ from tqdm import tqdm
 
 from dependency_map.sequence_logo import SequenceLogo
 from dependency_map.util import matplotlib_scale_as_plotly
+from dependency_map.annotation import insert_annotation_into_subplot
 
 # having this type be invariant is correct and useful, because it is used
 # as both a return type and argument
@@ -432,6 +434,53 @@ class DependencyMap:
         dependency_map = np.copy(self.dependency_map)
         dependency_map[row_idx, column_idx] = 0.0
         return dependency_map
+    
+
+    def plot_with_annotation(
+            self, 
+            annotation_tbl: pl.DataFrame, 
+            window_start: int, 
+            window_end: int, 
+
+            # plot arguments
+            **kwargs
+    ):
+        """Plot the dependency map with genomic annotation on top.
+
+        Args:
+            annotation_tbl: pl.DataFrame
+                Table containing the columns [start, end, label, type]. 
+                Contains annotation for regions (similar to BED format). 
+                `label` is the name (e.g. gene ID)
+                `type` e.g. (Exon, TFBS), used for coloring
+            window_start, window_end: int
+                Window of the dependency map in genomic coordinates. 
+                Assumes the coordinates in the table are on the same chromosome
+
+            **kwargs: other arguments to pass to self.plot
+        """
+
+        required_cols = ["label", "type", "start", "end"]
+        assert [col in ["label", "type", "start", "end"] for col in annotation_tbl.columns], f"Table columns is missing at least one necessary column: f{required_cols}"
+        
+        fig = make_subplots(
+            rows=2, 
+            cols=1, 
+            shared_xaxes=True, 
+            vertical_spacing=0.05, 
+            row_heights=[0.2, 0.8]
+        )
+        
+        fig = insert_annotation_into_subplot(
+            fig=fig,
+            ann_df=annotation_tbl, 
+            start_pos=window_start, 
+            end_pos=window_end
+        )
+
+        return self.plot(fig, row=2, col=1, xaxis_name="x", yaxis_name="y2", **kwargs)
+    
+
 
     def plot(
         self,
@@ -443,7 +492,8 @@ class DependencyMap:
         axis_offset: int | None = None,
         zmin: float | None = None,
         zmax: float | None = None,
-        zero_diagonal: bool = True,
+        zero_diagonal: bool = True
+
     ) -> go.Figure:
         """
         Plot the dependency map with sequence logos as a heatmap.
