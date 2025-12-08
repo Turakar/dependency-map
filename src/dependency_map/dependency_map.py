@@ -49,6 +49,9 @@ class DependencyMapOptions:
     dependency_by_masking: bool = False
     """If True, compute the dependency map by masking each position instead of mutating it."""
 
+    base_pairing: bool = False
+    """If True, only consider base-pairing interactions (A-T and C-G) in the dependency map."""
+
     def __post_init__(self) -> None:
         if self.subset is not None and self.subset_rows is None:
             self.subset_rows = self.subset
@@ -62,6 +65,8 @@ class DependencyMapOptions:
                 )
         if self.autoregressive and self.dependency_by_masking:
             raise ValueError("Dependency by masking is not supported for autoregressive models.")
+        if self.effect_on_reference_only and self.base_pairing:
+            raise ValueError("Effect on reference only is not supported with base pairing.")
 
     def num_samples(self, sequence_length: int) -> int:
         # Reference
@@ -306,18 +311,29 @@ class DependencyMap:
                 masked = logits[1:]
             reference_log_odds = _logits_to_log_odds(reference)
             masked_log_odds = _logits_to_log_odds(masked)
-            interaction_scores = masked_log_odds - reference_log_odds[None, :, :]
-            if options.effect_on_reference_only:
-                # Keep only the logits corresponding to the actual sequence
-                sequence_idx = np.array(["ACGT".index(nt) for nt in sequence])
-                interaction_scores = interaction_scores[
-                    np.arange(interaction_scores.shape[0])[:, None],
-                    np.arange(sequence_length)[None, :],
-                    sequence_idx[None, :],
-                ]
-                dependency_map = np.abs(interaction_scores)
+            sequence_idx = np.array(["ACGT".index(nt) for nt in sequence])
+            if options.base_pairing:
+                comp_idx = 3 - sequence_idx  # A-T and C-G pairing
+                reference_bp_log_odds = reference_log_odds[
+                    np.arange(sequence_length), comp_idx
+                ]  # L
+                masked_bp_log_odds = masked_log_odds[
+                    :, np.arange(sequence_length), comp_idx
+                ]  # M x L
+                interaction_scores = masked_bp_log_odds - reference_bp_log_odds[None, :]
+                dependency_map = interaction_scores
             else:
-                dependency_map = np.max(np.abs(interaction_scores), axis=2)
+                interaction_scores = masked_log_odds - reference_log_odds[None, :, :]
+                if options.effect_on_reference_only:
+                    # Keep only the logits corresponding to the actual sequence
+                    interaction_scores = interaction_scores[
+                        np.arange(interaction_scores.shape[0])[:, None],
+                        np.arange(sequence_length)[None, :],
+                        sequence_idx[None, :],
+                    ]
+                    dependency_map = np.abs(interaction_scores)
+                else:
+                    dependency_map = np.max(np.abs(interaction_scores), axis=2)
 
         else:
             # Pedro-style dependency maps: mutate each position and see effect on all other positions
@@ -332,19 +348,30 @@ class DependencyMap:
             mutated = mutated.reshape(num_rows, 3, sequence_length, 4)
             reference_log_odds = _logits_to_log_odds(reference)
             mutated_log_odds = _logits_to_log_odds(mutated)
-            interaction_scores = mutated_log_odds - reference_log_odds[None, None, :, :]
-            if options.effect_on_reference_only:
-                # Keep only the logits corresponding to the actual sequence
-                sequence_idx = np.array(["ACGT".index(nt) for nt in sequence])
-                interaction_scores = interaction_scores[
-                    np.arange(num_rows)[:, None, None],
-                    np.arange(3)[None, :, None],
-                    np.arange(sequence_length)[None, None, :],
-                    sequence_idx[None, None, :],
-                ]  # L x 3 x L
-                dependency_map = np.max(np.abs(interaction_scores), axis=1)  # L x L
+            sequence_idx = np.array(["ACGT".index(nt) for nt in sequence])
+            if options.base_pairing:
+                comp_idx = 3 - sequence_idx  # A-T and C-G pairing
+                reference_bp_log_odds = reference_log_odds[
+                    np.arange(sequence_length), comp_idx
+                ]  # L
+                mutated_bp_log_odds = mutated_log_odds[
+                    :, :, np.arange(sequence_length), comp_idx
+                ]  # M x 3 x L
+                interaction_scores = mutated_bp_log_odds - reference_bp_log_odds[None, None, :]
+                dependency_map = np.mean(interaction_scores, axis=1)  # L x L
             else:
-                dependency_map = np.max(np.abs(interaction_scores), axis=(1, 3))  # L x L
+                interaction_scores = mutated_log_odds - reference_log_odds[None, None, :, :]
+                if options.effect_on_reference_only:
+                    # Keep only the logits corresponding to the actual sequence
+                    interaction_scores = interaction_scores[
+                        np.arange(num_rows)[:, None, None],
+                        np.arange(3)[None, :, None],
+                        np.arange(sequence_length)[None, None, :],
+                        sequence_idx[None, None, :],
+                    ]  # L x 3 x L
+                    dependency_map = np.max(np.abs(interaction_scores), axis=1)  # L x L
+                else:
+                    dependency_map = np.max(np.abs(interaction_scores), axis=(1, 3))  # L x L
 
         return cls(sequence, dependency_map, reconstruction, options)
 
@@ -441,8 +468,8 @@ class DependencyMap:
         xaxis_name: str | None = None,
         yaxis_name: str | None = None,
         axis_offset: int | None = None,
-        zmin: float | None = None,
-        zmax: float | None = None,
+        zmin: float | None = 0.0,
+        zmax: float | None = 5.0,
         zero_diagonal: bool = True,
     ) -> go.Figure:
         """
@@ -513,14 +540,19 @@ class DependencyMap:
             axis_offset = 0
         x = np.arange(axis_offset, axis_offset + dependency_map.shape[1])
         y = np.arange(axis_offset, axis_offset + dependency_map.shape[0])
+        if self.options.base_pairing:
+            colorscale = "Plasma"
+            zmin = 0.0 if zmin is None else zmin
+        else:
+            colorscale = matplotlib_scale_as_plotly("coolwarm")
+        if zmin is not None or zmax is not None:
+            dependency_map = np.clip(dependency_map, a_min=zmin, a_max=zmax)
         fig.add_trace(
             go.Heatmap(
                 x=x,
                 y=y,
                 z=dependency_map,
-                zmin=zmin,
-                zmax=zmax,
-                colorscale=matplotlib_scale_as_plotly("coolwarm"),
+                colorscale=colorscale,
             ),
             row=row,
             col=col,

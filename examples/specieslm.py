@@ -20,6 +20,8 @@ def main() -> None:
         "AGGTTTTATTGCCCTACGCTTAATCCCAAATTTTGCCACCATATAAAATGAGTACGAGCGATATAATCGGACAACTGAATAGAAGCTTCTGACCAAGTGATATCTTATT"
         "AATACAAATCTACTGTACGATG"
     )
+    # tRNA
+    # reference_sequence = "TTTTCTCAAGATCTGTTCCTCGTGGCCCAATGGTCACGGCGTCTGGCTACGAACCAGAAGATTCCAGGTTCAAGTCCTGGCGGGGAAGATTTTTTTTAACATT"
     device = torch.device("cuda:0") if torch.cuda.is_available() else torch.device("cpu")
     model = BertForMaskedLM.from_pretrained(model_name, trust_remote_code=True)
     model.to(device)  # pyright: ignore[reportArgumentType]
