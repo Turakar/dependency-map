@@ -50,7 +50,9 @@ class DependencyMapOptions:
     """If True, compute the dependency map by masking each position instead of mutating it."""
 
     base_pairing: bool = False
-    """If True, only consider base-pairing interactions (A-T and C-G) in the dependency map."""
+    """If True, compute a base-pairing map instead: for every base b the query can carry, the
+    log2-odds of the complement of b at the target, summed over the four bases and centred per
+    target. Requires mutation-based dependency maps."""
 
     def __post_init__(self) -> None:
         if self.subset is not None and self.subset_rows is None:
@@ -67,6 +69,10 @@ class DependencyMapOptions:
             raise ValueError("Dependency by masking is not supported for autoregressive models.")
         if self.effect_on_reference_only and self.base_pairing:
             raise ValueError("Effect on reference only is not supported with base pairing.")
+        if self.dependency_by_masking and self.base_pairing:
+            raise ValueError(
+                "Base pairing needs every base at the query, which masking does not provide."
+            )
 
     def num_samples(self, sequence_length: int) -> int:
         # Reference
@@ -311,29 +317,18 @@ class DependencyMap:
                 masked = logits[1:]
             reference_log_odds = _logits_to_log_odds(reference)
             masked_log_odds = _logits_to_log_odds(masked)
-            sequence_idx = np.array(["ACGT".index(nt) for nt in sequence])
-            if options.base_pairing:
-                comp_idx = 3 - sequence_idx  # A-T and C-G pairing
-                reference_bp_log_odds = reference_log_odds[
-                    np.arange(sequence_length), comp_idx
-                ]  # L
-                masked_bp_log_odds = masked_log_odds[
-                    :, np.arange(sequence_length), comp_idx
-                ]  # M x L
-                interaction_scores = masked_bp_log_odds - reference_bp_log_odds[None, :]
-                dependency_map = interaction_scores
+            interaction_scores = masked_log_odds - reference_log_odds[None, :, :]
+            if options.effect_on_reference_only:
+                # Keep only the logits corresponding to the actual sequence
+                sequence_idx = np.array(["ACGT".index(nt) for nt in sequence])
+                interaction_scores = interaction_scores[
+                    np.arange(interaction_scores.shape[0])[:, None],
+                    np.arange(sequence_length)[None, :],
+                    sequence_idx[None, :],
+                ]
+                dependency_map = np.abs(interaction_scores)
             else:
-                interaction_scores = masked_log_odds - reference_log_odds[None, :, :]
-                if options.effect_on_reference_only:
-                    # Keep only the logits corresponding to the actual sequence
-                    interaction_scores = interaction_scores[
-                        np.arange(interaction_scores.shape[0])[:, None],
-                        np.arange(sequence_length)[None, :],
-                        sequence_idx[None, :],
-                    ]
-                    dependency_map = np.abs(interaction_scores)
-                else:
-                    dependency_map = np.max(np.abs(interaction_scores), axis=2)
+                dependency_map = np.max(np.abs(interaction_scores), axis=2)
 
         else:
             # Pedro-style dependency maps: mutate each position and see effect on all other positions
@@ -350,15 +345,13 @@ class DependencyMap:
             mutated_log_odds = _logits_to_log_odds(mutated)
             sequence_idx = np.array(["ACGT".index(nt) for nt in sequence])
             if options.base_pairing:
-                comp_idx = 3 - sequence_idx  # A-T and C-G pairing
-                reference_bp_log_odds = reference_log_odds[
-                    np.arange(sequence_length), comp_idx
-                ]  # L
-                mutated_bp_log_odds = mutated_log_odds[
-                    :, :, np.arange(sequence_length), comp_idx
-                ]  # M x 3 x L
-                interaction_scores = mutated_bp_log_odds - reference_bp_log_odds[None, None, :]
-                dependency_map = np.mean(interaction_scores, axis=1)  # L x L
+                if options.subset_rows is not None:
+                    row_start, row_end = options.get_subset_rows_in_subset()
+                else:
+                    row_start, row_end = 0, sequence_length
+                dependency_map = _base_pairing_map(
+                    sequence_idx[row_start:row_end], reference_log_odds, mutated_log_odds
+                )
             else:
                 interaction_scores = mutated_log_odds - reference_log_odds[None, None, :, :]
                 if options.effect_on_reference_only:
@@ -688,6 +681,34 @@ def _reverse_complement(sequence: str) -> str:
         The reverse complement of the sequence.
     """
     return "".join({"A": "T", "C": "G", "G": "C", "T": "A"}[nt] for nt in reversed(sequence))
+
+
+def _base_pairing_map(
+    query_idx: np.ndarray, reference_log_odds: np.ndarray, mutated_log_odds: np.ndarray
+) -> np.ndarray:
+    """
+    Sum over the four bases b a query can carry of the log2-odds of complement(b) at each target,
+    centred per target so that targets which ignore the query score zero.
+
+    Args:
+        query_idx: Reference base indices (ACGT) of the query rows, shape (R,).
+        reference_log_odds: Log odds of the reference sample, shape (L, 4).
+        mutated_log_odds: Log odds of the mutants, shape (R, 3, L, 4), alternatives in ACGT order.
+
+    Returns:
+        The base-pairing map, shape (R, L).
+    """
+    bases = np.arange(4)[None, :]
+    complements = 3 - bases
+    is_reference_base = bases == query_idx[:, None]
+    # Mutants skip the reference base; its clipped slot is overridden by the reference sample.
+    mutant_slot = np.minimum(bases - (bases > query_idx[:, None]), 2)
+    rows = np.arange(len(query_idx))[:, None]
+    from_mutants = mutated_log_odds[rows, mutant_slot, :, complements]
+    from_reference = reference_log_odds[:, complements[0]].T[None]
+    log_odds = np.where(is_reference_base[:, :, None], from_reference, from_mutants)
+    scores = log_odds.sum(axis=1) / np.log(2)
+    return scores - scores.mean(axis=0, keepdims=True)
 
 
 def _logits_to_log_odds(logits: np.ndarray) -> np.ndarray:
