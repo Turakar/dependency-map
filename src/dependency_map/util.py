@@ -1,6 +1,11 @@
 import numpy as np
 from matplotlib import cm as matplotlib_cm
 
+try:  # matplotlib >= 3.5; `cm.get_cmap` was removed in 3.9
+    from matplotlib import colormaps as matplotlib_colormaps
+except ImportError:
+    matplotlib_colormaps = None
+
 
 def matplotlib_scale_as_plotly(name: str, num_entries: int = 255) -> list[tuple[float, str]]:
     """Prepare a matplotlib colormap for use in Plotly.
@@ -18,7 +23,10 @@ def matplotlib_scale_as_plotly(name: str, num_entries: int = 255) -> list[tuple[
     """
     # https://plotly.com/python/v3/matplotlib-colorscales/
 
-    cmap = matplotlib_cm.get_cmap(name)
+    if matplotlib_colormaps is not None:
+        cmap = matplotlib_colormaps[name]
+    else:
+        cmap = matplotlib_cm.get_cmap(name)
     h = 1.0 / (num_entries - 1)
     pl_colorscale = []
 
